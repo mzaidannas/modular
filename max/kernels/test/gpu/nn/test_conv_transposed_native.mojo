@@ -62,14 +62,38 @@ def test_conv_transposed_native[
     Args:
         ctx: Device context used to launch the kernel.
     """
-    comptime HO = stride_val * (H - 1) + dilation_val * (R - 1) - 2 * pad_val + 1
-    comptime WO = stride_val * (W - 1) + dilation_val * (S - 1) - 2 * pad_val + 1
+    comptime HO = stride_val * (H - 1) + dilation_val * (
+        R - 1
+    ) - 2 * pad_val + 1
+    comptime WO = stride_val * (W - 1) + dilation_val * (
+        S - 1
+    ) - 2 * pad_val + 1
 
     print(
-        "N=", N, " H=", H, " W=", W, " R=", R, " S=", S,
-        " Cin=", in_channels, " Cout=", out_channels,
-        " stride=", stride_val, " dilation=", dilation_val, " pad=", pad_val,
-        " -> HO=", HO, " WO=", WO,
+        "N=",
+        N,
+        " H=",
+        H,
+        " W=",
+        W,
+        " R=",
+        R,
+        " S=",
+        S,
+        " Cin=",
+        in_channels,
+        " Cout=",
+        out_channels,
+        " stride=",
+        stride_val,
+        " dilation=",
+        dilation_val,
+        " pad=",
+        pad_val,
+        " -> HO=",
+        HO,
+        " WO=",
+        WO,
     )
 
     comptime input_size = N * H * W * in_channels
@@ -177,11 +201,24 @@ def main() raises:
             H=8, W=8, R=3, S=3, in_channels=8, out_channels=16, stride_val=2
         ](ctx)
         test_conv_transposed_native[
-            H=8, W=8, R=3, S=3, in_channels=3, out_channels=5, stride_val=2,
+            H=8,
+            W=8,
+            R=3,
+            S=3,
+            in_channels=3,
+            out_channels=5,
+            stride_val=2,
             pad_val=1,
         ](ctx)
         test_conv_transposed_native[
-            H=4, W=5, R=3, S=3, in_channels=6, out_channels=4, N=2,
-            stride_val=2, pad_val=1,
+            H=4,
+            W=5,
+            R=3,
+            S=3,
+            in_channels=6,
+            out_channels=4,
+            N=2,
+            stride_val=2,
+            pad_val=1,
         ](ctx)
         print("All native conv_transpose tests passed.")

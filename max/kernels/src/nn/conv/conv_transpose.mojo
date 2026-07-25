@@ -1979,6 +1979,7 @@ def _conv_transpose_gather_2d_kernel[
     filter_type: DType,
     output_type: DType,
     acc_type: DType,
+    micro_f: Int,
     InputLayoutType: TensorLayout,
     input_origin: ImmOrigin,
     FilterLayoutType: TensorLayout,
@@ -2012,13 +2013,19 @@ def _conv_transpose_gather_2d_kernel[
     pad_h0: Int,
     pad_w0: Int,
 ):
-    """Gather-based 2D transposed convolution: one output element per thread.
+    """Gather-based 2D transposed convolution.
+
+    Each thread owns one output spatial location `(n, ho, wo)` and a tile of
+    `micro_f` output channels. The input channel vector is loaded once per tap
+    and reused across the whole `micro_f` tile (Opt 3: register-tiling over F
+    with input reuse), which cuts input global-memory traffic by `micro_f`x.
 
     Parameters:
         input_type: Element type of the input tensor.
         filter_type: Element type of the filter tensor.
         output_type: Element type of the output tensor.
         acc_type: Accumulation type (float32 for floating inputs).
+        micro_f: Number of output channels each thread accumulates.
         InputLayoutType: Compile-time layout of the input tensor.
         input_origin: Immutable memory origin of the input tensor.
         FilterLayoutType: Compile-time layout of the filter tensor.
@@ -2058,7 +2065,8 @@ def _conv_transpose_gather_2d_kernel[
     var R = flt_shape[0]
     var S = flt_shape[1]
 
-    var total = N * HO * WO * F
+    var num_f_tiles = ceildiv(F, micro_f)
+    var total = N * HO * WO * num_f_tiles
     var grid_stride = Int(grid_dim.x * block_dim.x)
 
     # Opt (1): for dilation == 1 the live taps form an arithmetic sequence, so we
@@ -2069,17 +2077,26 @@ def _conv_transpose_gather_2d_kernel[
 
     var i = Int(global_idx.x)
     while i < total:
-        # Decode the flat index into (n, ho, wo, f); F is innermost.
+        # Decode the flat index into (n, ho, wo, f_tile); the F tile is innermost.
         var tmp = i
-        var f = tmp % F
-        tmp //= F
+        var f_tile = tmp % num_f_tiles
+        tmp //= num_f_tiles
         var wo = tmp % WO
         tmp //= WO
         var ho = tmp % HO
         tmp //= HO
         var n = tmp
 
-        var acc = Scalar[acc_type](0)
+        var f0 = f_tile * micro_f
+
+        # Opt (3): one SIMD accumulator per output channel in the tile, plus a
+        # scalar tail accumulator for the C % simd_size remainder.
+        var vacc = InlineArray[SIMD[acc_type, simd_size], micro_f](
+            fill=SIMD[acc_type, simd_size](0)
+        )
+        var sacc = InlineArray[Scalar[acc_type], micro_f](
+            fill=Scalar[acc_type](0)
+        )
 
         var r_start = (ho + pad_h0) % stride_h if dil_h == 1 else 0
         var r = r_start
@@ -2101,47 +2118,61 @@ def _conv_transpose_gather_2d_kernel[
                         if wnum % stride_w == 0:
                             var w = wnum // stride_w
                             if w < W:
-                                # Contraction over the contiguous C axis.
+                                # Contraction over the contiguous C axis. The
+                                # input vector is loaded once and reused across
+                                # the whole micro_f tile; the filter slice for
+                                # each channel is contiguous in C (RSFC).
                                 var in_base = ((n * H + h) * W + w) * C
-                                var flt_base = ((r * S + s) * F + f) * C
+                                var flt_base = ((r * S + s) * F + f0) * C
 
-                                var vacc = SIMD[acc_type, simd_size](0)
                                 var c = 0
                                 while c + simd_size <= C:
                                     var xv = input.ptr.load[width=simd_size](
                                         in_base + c
                                     ).cast[acc_type]()
-                                    var wv = filter.ptr.load[width=simd_size](
-                                        flt_base + c
-                                    ).cast[acc_type]()
-                                    vacc = xv.fma(wv, vacc)
+
+                                    comptime for jf in range(micro_f):
+                                        if f0 + jf < F:
+                                            var wv = filter.ptr.load[
+                                                width=simd_size
+                                            ](flt_base + jf * C + c).cast[
+                                                acc_type
+                                            ]()
+                                            vacc[jf] = xv.fma(wv, vacc[jf])
                                     c += simd_size
-                                acc += vacc.reduce_add()
 
                                 # Scalar tail for C % simd_size.
                                 while c < C:
-                                    acc += (
-                                        input.ptr.load(in_base + c).cast[
-                                            acc_type
-                                        ]()
-                                        * filter.ptr.load(flt_base + c).cast[
-                                            acc_type
-                                        ]()
-                                    )
+                                    var xs = input.ptr.load(in_base + c).cast[
+                                        acc_type
+                                    ]()
+
+                                    comptime for jf in range(micro_f):
+                                        if f0 + jf < F:
+                                            sacc[jf] += (
+                                                xs
+                                                * filter.ptr.load(
+                                                    flt_base + jf * C + c
+                                                ).cast[acc_type]()
+                                            )
                                     c += 1
                         s += s_step
             r += r_step
 
-        var out_base = ((n * HO + ho) * WO + wo) * F + f
+        var out_base = ((n * HO + ho) * WO + wo) * F + f0
 
-        comptime if elementwise_epilogue:
-            comptime epilogue = elementwise_epilogue.value()
-            epilogue(
-                Index(n, ho, wo, f),
-                SIMD[output_type, 1](acc.cast[output_type]()),
-            )
-        else:
-            output.ptr.store(out_base, acc.cast[output_type]())
+        comptime for jf in range(micro_f):
+            if f0 + jf < F:
+                var acc = vacc[jf].reduce_add() + sacc[jf]
+
+                comptime if elementwise_epilogue:
+                    comptime epilogue = elementwise_epilogue.value()
+                    epilogue(
+                        Index(n, ho, wo, f0 + jf),
+                        SIMD[output_type, 1](acc.cast[output_type]()),
+                    )
+                else:
+                    output.ptr.store(out_base + jf, acc.cast[output_type]())
 
         i += grid_stride
 
@@ -2211,7 +2242,12 @@ def conv_transposed_gpu_native[
         1,
     )
 
-    var total = conv_shape.n * conv_shape.ho() * conv_shape.wo() * conv_shape.f
+    # Opt (3): each thread accumulates `micro_f` output channels, reusing the
+    # input channel vector across the tile.
+    comptime micro_f = 4
+
+    var num_f_tiles = ceildiv(conv_shape.f, micro_f)
+    var total = conv_shape.n * conv_shape.ho() * conv_shape.wo() * num_f_tiles
     if total == 0:
         return
 
@@ -2223,6 +2259,7 @@ def conv_transposed_gpu_native[
         filter_type,
         output_type,
         acc_type,
+        micro_f,
         InputLayoutType=input.LayoutType,
         input_origin=ImmOrigin(input.origin),
         FilterLayoutType=filter.LayoutType,
