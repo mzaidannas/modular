@@ -26,6 +26,7 @@ import extensibility
 
 from max.gpu.host import DeviceContext
 from max.gpu.host.info import is_cpu, is_gpu
+from std.sys.info import has_nvidia_gpu_accelerator
 from layout import IntTuple, TileTensor, coord_to_index_list
 from linalg.fp8_quantization import convert_e4m3fn_to_e4m3fnuz
 from nn.conv.conv import ConvInfoStatic, conv_gpu, conv_nhwc_direct, conv_shape
@@ -34,6 +35,7 @@ from nn.conv.conv_transpose import (
     conv_transpose_shape,
     conv_transposed_cpu,
     conv_transposed_gpu,
+    conv_transposed_gpu_native,
 )
 from nn.conv.conv_utils import elementwise_simd_epilogue_type
 from nn.pad import pad_constant, pad_reflect, pad_repeat, pad_shape
@@ -748,37 +750,59 @@ struct ConvTranspose:
         else:
             comptime assert (
                 input.rank == 4 and filter.rank == 4
-            ), "only rank 4 tensor is supported on cuda gpu"
+            ), "only rank 4 tensor is supported on gpu"
             comptime assert (
                 filter_packed == False
-            ), "only unpacked filter is supported on cuda gpu"
+            ), "only unpacked filter is supported on gpu"
 
-            var pad_tuple = IndexList[
-                type_of(input.to_tile_tensor[.int64]()).rank - 2
-            ](0)
+            comptime maybe_epilogue = Optional[elementwise_simd_epilogue_type](
+                output_fn
+            ) if has_epilogue_fusion else Optional[
+                elementwise_simd_epilogue_type
+            ]()
 
-            comptime if input.rank == 4:
-                pad_tuple[0] = pad_h[0]
-                pad_tuple[1] = pad_w[0]
+            comptime if has_nvidia_gpu_accelerator():
+                # NVIDIA: cuDNN backward-data path.
+                var pad_tuple = IndexList[
+                    type_of(input.to_tile_tensor[.int64]()).rank - 2
+                ](0)
 
-            conv_transposed_gpu[
-                input.dtype,
-                filter.dtype,
-                output.dtype,
-                elementwise_epilogue=Optional[elementwise_simd_epilogue_type](
-                    output_fn
-                ) if has_epilogue_fusion else Optional[
-                    elementwise_simd_epilogue_type
-                ](),
-            ](
-                output.to_tile_tensor[.int64](),
-                input.to_tile_tensor[.int64](),
-                filter.to_tile_tensor[.int64](),
-                stride_tuple,
-                dilation_tuple,
-                pad_tuple,
-                ctx,
-            )
+                comptime if input.rank == 4:
+                    pad_tuple[0] = pad_h[0]
+                    pad_tuple[1] = pad_w[0]
+
+                conv_transposed_gpu[
+                    input.dtype,
+                    filter.dtype,
+                    output.dtype,
+                    elementwise_epilogue=maybe_epilogue,
+                ](
+                    output.to_tile_tensor[.int64](),
+                    input.to_tile_tensor[.int64](),
+                    filter.to_tile_tensor[.int64](),
+                    stride_tuple,
+                    dilation_tuple,
+                    pad_tuple,
+                    ctx,
+                )
+            else:
+                # Vendor-neutral native gather kernel (Apple Silicon, AMD, etc.).
+                conv_transposed_gpu_native[
+                    input.dtype,
+                    filter.dtype,
+                    output.dtype,
+                    elementwise_epilogue=maybe_epilogue,
+                ](
+                    output.to_tile_tensor[.int64](),
+                    input.to_tile_tensor[.int64](),
+                    filter.to_tile_tensor[.int64](),
+                    stride_tuple,
+                    dilation_tuple,
+                    pad_d,
+                    pad_h,
+                    pad_w,
+                    ctx,
+                )
 
 
 @extensibility.register_shape_function("mo.conv_transpose")

@@ -47,6 +47,7 @@ from max.algorithm import (
     sync_parallelize,
 )
 from max.gpu.host import DeviceContext
+from std.gpu import block_dim, global_idx, grid_dim
 from layout import (
     Coord,
     TensorLayout,
@@ -1936,3 +1937,311 @@ def conv_transposed_cudnn[
         _conv_transposed_cudnn(
             input, filter, output, stride, dilation, padding, ctx
         )
+
+
+# ===----------------------------------------------------------------------=== #
+# Native Gather-Based Transposed Convolution GPU Kernel                        #
+# ===----------------------------------------------------------------------=== #
+#
+# Vendor-neutral GPU path for backends without cuDNN (Apple Silicon, AMD, or any
+# future accelerator). Unlike the scatter formulation in `conv_transpose_naive`
+# -- where each input point sprays contributions into an overlapping output
+# window and would need atomics on the GPU -- this kernel is a *gather*: every
+# thread owns exactly one output element `(n, ho, wo, f)` and sums the input and
+# filter taps that map onto it. Because each output element is written by a
+# single thread there are no atomics and no separate output-zeroing pass.
+#
+# Layouts match the rest of this file: input `NHWC`, filter `RSFC`
+# (R, S, F=out_channels, C=in_channels), output `NHWC`.
+#
+# Optimizations in this first cut:
+#   (1) Polyphase tap iteration. Whether a filter row `r` contributes to output
+#       row `ho` depends only on the coordinate's phase modulo the stride, not on
+#       `f` or `c`. For the common `dilation == 1` case we start at the first live
+#       tap and step by `stride`, so the R/S loops visit only the ~R/stride live
+#       taps instead of all R and never spin on dead iterations. The divisibility
+#       guard is retained so dilated filters stay correct.
+#   (2) SIMD-vectorized contraction over the input-channel axis `C`. `C` is the
+#       contiguous (innermost) axis of both `NHWC` input and `RSFC` filter, so the
+#       reduction issues coalesced vector loads and folds them with a horizontal
+#       `reduce_add`, plus a scalar tail for `C % simd_width`.
+#
+# Documented follow-ups (not in this cut): register-tiling over `F` with input
+# reuse (needs an `FRSCf` filter repack, mirroring `pack_filter` -- `F` is strided
+# in `RSFC`), threadgroup staging of the reused filter tile, interior/halo region
+# unswitching (mirroring `tile_middle_unswitch_boundaries` on the CPU path), and
+# graduating the inner loop to the `AppleM5MatMul` fragment MMA.
+
+
+@__name(t"conv_transpose_gather_2d_{output_type}")
+def _conv_transpose_gather_2d_kernel[
+    input_type: DType,
+    filter_type: DType,
+    output_type: DType,
+    acc_type: DType,
+    InputLayoutType: TensorLayout,
+    input_origin: ImmOrigin,
+    FilterLayoutType: TensorLayout,
+    filter_origin: ImmOrigin,
+    OutputLayoutType: TensorLayout,
+    output_origin: MutOrigin,
+    elementwise_epilogue: Optional[elementwise_simd_epilogue_type],
+](
+    output: TileTensor[
+        output_type,
+        OutputLayoutType,
+        output_origin,
+        address_space=AddressSpace.GENERIC,
+    ],
+    input: TileTensor[
+        input_type,
+        InputLayoutType,
+        input_origin,
+        address_space=AddressSpace.GENERIC,
+    ],
+    filter: TileTensor[
+        filter_type,
+        FilterLayoutType,
+        filter_origin,
+        address_space=AddressSpace.GENERIC,
+    ],
+    stride_h: Int,
+    stride_w: Int,
+    dil_h: Int,
+    dil_w: Int,
+    pad_h0: Int,
+    pad_w0: Int,
+):
+    """Gather-based 2D transposed convolution: one output element per thread.
+
+    Parameters:
+        input_type: Element type of the input tensor.
+        filter_type: Element type of the filter tensor.
+        output_type: Element type of the output tensor.
+        acc_type: Accumulation type (float32 for floating inputs).
+        InputLayoutType: Compile-time layout of the input tensor.
+        input_origin: Immutable memory origin of the input tensor.
+        FilterLayoutType: Compile-time layout of the filter tensor.
+        filter_origin: Immutable memory origin of the filter tensor.
+        OutputLayoutType: Compile-time layout of the output tensor.
+        output_origin: Mutable memory origin of the output tensor.
+        elementwise_epilogue: Optional fused elementwise epilogue applied to each
+            output element.
+
+    Args:
+        output: Output tensor in NHWC layout on device.
+        input: Input tensor in NHWC layout on device.
+        filter: Filter tensor in RSFC layout on device.
+        stride_h: Stride along the height axis.
+        stride_w: Stride along the width axis.
+        dil_h: Dilation along the height axis of the filter.
+        dil_w: Dilation along the width axis of the filter.
+        pad_h0: Lower padding along the height axis.
+        pad_w0: Lower padding along the width axis.
+    """
+    comptime simd_size = simd_width_of[acc_type]()
+
+    # Dimensions are carried by the tensor layouts (NHWC input/output, RSFC
+    # filter). The convolution attributes arrive as scalar arguments because a
+    # struct like `ConvShape` is not `DevicePassable`.
+    var in_shape = coord_to_index_list(input.layout.shape_coord())
+    var out_shape = coord_to_index_list(output.layout.shape_coord())
+    var flt_shape = coord_to_index_list(filter.layout.shape_coord())
+
+    var N = in_shape[0]
+    var H = in_shape[1]
+    var W = in_shape[2]
+    var C = in_shape[3]
+    var HO = out_shape[1]
+    var WO = out_shape[2]
+    var F = out_shape[3]
+    var R = flt_shape[0]
+    var S = flt_shape[1]
+
+    var total = N * HO * WO * F
+    var grid_stride = Int(grid_dim.x * block_dim.x)
+
+    # Opt (1): for dilation == 1 the live taps form an arithmetic sequence, so we
+    # start at the phase offset and step by the stride. Otherwise fall back to a
+    # dense scan guarded by the divisibility test below.
+    var r_step = stride_h if dil_h == 1 else 1
+    var s_step = stride_w if dil_w == 1 else 1
+
+    var i = Int(global_idx.x)
+    while i < total:
+        # Decode the flat index into (n, ho, wo, f); F is innermost.
+        var tmp = i
+        var f = tmp % F
+        tmp //= F
+        var wo = tmp % WO
+        tmp //= WO
+        var ho = tmp % HO
+        tmp //= HO
+        var n = tmp
+
+        var acc = Scalar[acc_type](0)
+
+        var r_start = (ho + pad_h0) % stride_h if dil_h == 1 else 0
+        var r = r_start
+        while r < R:
+            # `hnum` decreases monotonically in `r`; once negative it stays so.
+            var hnum = ho + pad_h0 - r * dil_h
+            if hnum < 0:
+                break
+            if hnum % stride_h == 0:
+                var h = hnum // stride_h
+                # `hnum >= 0` (guaranteed by the break above) => `h >= 0`.
+                if h < H:
+                    var s_start = (wo + pad_w0) % stride_w if dil_w == 1 else 0
+                    var s = s_start
+                    while s < S:
+                        var wnum = wo + pad_w0 - s * dil_w
+                        if wnum < 0:
+                            break
+                        if wnum % stride_w == 0:
+                            var w = wnum // stride_w
+                            if w < W:
+                                # Contraction over the contiguous C axis.
+                                var in_base = ((n * H + h) * W + w) * C
+                                var flt_base = ((r * S + s) * F + f) * C
+
+                                var vacc = SIMD[acc_type, simd_size](0)
+                                var c = 0
+                                while c + simd_size <= C:
+                                    var xv = input.ptr.load[width=simd_size](
+                                        in_base + c
+                                    ).cast[acc_type]()
+                                    var wv = filter.ptr.load[width=simd_size](
+                                        flt_base + c
+                                    ).cast[acc_type]()
+                                    vacc = xv.fma(wv, vacc)
+                                    c += simd_size
+                                acc += vacc.reduce_add()
+
+                                # Scalar tail for C % simd_size.
+                                while c < C:
+                                    acc += (
+                                        input.ptr.load(in_base + c).cast[
+                                            acc_type
+                                        ]()
+                                        * filter.ptr.load(flt_base + c).cast[
+                                            acc_type
+                                        ]()
+                                    )
+                                    c += 1
+                        s += s_step
+            r += r_step
+
+        var out_base = ((n * HO + ho) * WO + wo) * F + f
+
+        comptime if elementwise_epilogue:
+            comptime epilogue = elementwise_epilogue.value()
+            epilogue(
+                Index(n, ho, wo, f),
+                SIMD[output_type, 1](acc.cast[output_type]()),
+            )
+        else:
+            output.ptr.store(out_base, acc.cast[output_type]())
+
+        i += grid_stride
+
+
+def conv_transposed_gpu_native[
+    input_type: DType,
+    filter_type: DType,
+    output_type: DType,
+    elementwise_epilogue: Optional[elementwise_simd_epilogue_type] = None,
+](
+    output: TileTensor[
+        mut=True, output_type, address_space=AddressSpace.GENERIC, ...
+    ],
+    input: TileTensor[
+        mut=False, input_type, address_space=AddressSpace.GENERIC, ...
+    ],
+    filter: TileTensor[
+        mut=False, filter_type, address_space=AddressSpace.GENERIC, ...
+    ],
+    stride: IndexList[input.rank - 2],
+    dilation: IndexList[input.rank - 2],
+    pad_d: IndexList[2],
+    pad_h: IndexList[2],
+    pad_w: IndexList[2],
+    ctx: DeviceContext,
+) raises:
+    """Runs a 2D transposed convolution on any GPU via the native gather kernel.
+
+    This is the vendor-neutral counterpart to `conv_transposed_gpu` (which is
+    cuDNN/NVIDIA-only): it lowers to a hand-written gather kernel that runs on
+    Apple Silicon, AMD, or any backend `DeviceContext` supports. The filter is
+    consumed unpacked in RSFC layout.
+
+    Parameters:
+        input_type: Element type of the input tensor.
+        filter_type: Element type of the filter tensor.
+        output_type: Element type of the output tensor.
+        elementwise_epilogue: Optional fused elementwise epilogue.
+
+    Args:
+        output: Output tensor in NHWC layout on device.
+        input: Input tensor in NHWC layout on device.
+        filter: Unpacked filter tensor in RSFC layout on device.
+        stride: Stride along each spatial axis.
+        dilation: Dilation along each spatial axis of the filter.
+        pad_d: Depth padding as (lower, upper); unused for the 2D path.
+        pad_h: Height padding as (lower, upper).
+        pad_w: Width padding as (lower, upper).
+        ctx: Device context used to launch the kernel.
+    """
+    comptime assert (
+        input.rank == 4 and filter.rank == 4
+    ), "native GPU conv_transpose currently supports rank-4 (2D) inputs only"
+
+    # Accumulate floating-point convolutions in float32 for accuracy.
+    comptime acc_type = DType.float32 if output_type.is_floating_point() else output_type
+
+    var conv_shape = get_conv_shape[2, False](
+        output,
+        input,
+        filter,
+        rebind[IndexList[2]](stride),
+        rebind[IndexList[2]](dilation),
+        pad_d,
+        pad_h,
+        pad_w,
+        1,
+    )
+
+    var total = conv_shape.n * conv_shape.ho() * conv_shape.wo() * conv_shape.f
+    if total == 0:
+        return
+
+    comptime block_size = 256
+    var grid_size = ceildiv(total, block_size)
+
+    comptime kernel = _conv_transpose_gather_2d_kernel[
+        input_type,
+        filter_type,
+        output_type,
+        acc_type,
+        InputLayoutType=input.LayoutType,
+        input_origin=ImmOrigin(input.origin),
+        FilterLayoutType=filter.LayoutType,
+        filter_origin=ImmOrigin(filter.origin),
+        OutputLayoutType=output.LayoutType,
+        output_origin=output.origin,
+        elementwise_epilogue=elementwise_epilogue,
+    ]
+
+    ctx.enqueue_function[kernel](
+        output,
+        input.as_immut(),
+        filter.as_immut(),
+        conv_shape.stride[0],
+        conv_shape.stride[1],
+        conv_shape.dilation[0],
+        conv_shape.dilation[1],
+        conv_shape.pad_h[0],
+        conv_shape.pad_w[0],
+        grid_dim=(grid_size,),
+        block_dim=(block_size,),
+    )
