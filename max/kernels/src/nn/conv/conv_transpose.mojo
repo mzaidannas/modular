@@ -2069,12 +2069,6 @@ def _conv_transpose_gather_2d_kernel[
     var total = N * HO * WO * num_f_tiles
     var grid_stride = Int(grid_dim.x * block_dim.x)
 
-    # Opt (1): for dilation == 1 the live taps form an arithmetic sequence, so we
-    # start at the phase offset and step by the stride. Otherwise fall back to a
-    # dense scan guarded by the divisibility test below.
-    var r_step = stride_h if dil_h == 1 else 1
-    var s_step = stride_w if dil_w == 1 else 1
-
     var i = Int(global_idx.x)
     while i < total:
         # Decode the flat index into (n, ho, wo, f_tile); the F tile is innermost.
@@ -2098,66 +2092,124 @@ def _conv_transpose_gather_2d_kernel[
             fill=Scalar[acc_type](0)
         )
 
-        var r_start = (ho + pad_h0) % stride_h if dil_h == 1 else 0
-        var r = r_start
-        while r < R:
-            # `hnum` decreases monotonically in `r`; once negative it stays so.
-            var hnum = ho + pad_h0 - r * dil_h
-            if hnum < 0:
-                break
-            if hnum % stride_h == 0:
-                var h = hnum // stride_h
-                # `hnum >= 0` (guaranteed by the break above) => `h >= 0`.
-                if h < H:
-                    var s_start = (wo + pad_w0) % stride_w if dil_w == 1 else 0
-                    var s = s_start
-                    while s < S:
-                        var wnum = wo + pad_w0 - s * dil_w
-                        if wnum < 0:
-                            break
-                        if wnum % stride_w == 0:
-                            var w = wnum // stride_w
-                            if w < W:
-                                # Contraction over the contiguous C axis. The
-                                # input vector is loaded once and reused across
-                                # the whole micro_f tile; the filter slice for
-                                # each channel is contiguous in C (RSFC).
-                                var in_base = ((n * H + h) * W + w) * C
-                                var flt_base = ((r * S + s) * F + f0) * C
+        # Contraction over the contiguous C axis for one filter tap `(r, s)`
+        # mapping to input `(h, w)`. The input channel vector is loaded once and
+        # reused across the whole micro_f tile (Opt 3); the filter slice for each
+        # channel is contiguous in C (RSFC).
+        # Opt (5): interior/halo unswitch. For the common dilation == 1 case,
+        # compute tight [lo, hi] tap ranges so every iterated tap is guaranteed
+        # to land on a valid input element -- the tap loops then carry no bounds
+        # branches at all. Derivation for the height axis (width is symmetric):
+        # a tap `r` contributes to output row `ho` iff
+        #   hnum := ho + pad_h0 - r >= 0            (r <= ho + pad_h0)
+        #   h    := hnum / stride_h  <  H           (r >= ho + pad_h0 - (H-1)*stride_h)
+        #   hnum % stride_h == 0                    (r == (ho + pad_h0) mod stride_h)
+        # so `r` sweeps an arithmetic sequence with step `stride_h`. The general
+        # dilated case falls back to the guarded polyphase scan (Opt 1). The
+        # per-tap C contraction is inlined in both branches (a nested closure
+        # cannot capture the register-passable tensors alongside the mutable
+        # accumulators).
+        if dil_h == 1 and dil_w == 1:
+            var p_h = (ho + pad_h0) % stride_h
+            var r_hi = min(R - 1, ho + pad_h0)
+            var r_lo_base = max(0, ho + pad_h0 - (H - 1) * stride_h)
+            var r_lo = (
+                r_lo_base
+                + (((p_h - r_lo_base) % stride_h) + stride_h) % stride_h
+            )
 
-                                var c = 0
-                                while c + simd_size <= C:
-                                    var xv = input.ptr.load[width=simd_size](
-                                        in_base + c
+            var p_w = (wo + pad_w0) % stride_w
+            var s_hi = min(S - 1, wo + pad_w0)
+            var s_lo_base = max(0, wo + pad_w0 - (W - 1) * stride_w)
+            var s_lo = (
+                s_lo_base
+                + (((p_w - s_lo_base) % stride_w) + stride_w) % stride_w
+            )
+
+            var r = r_lo
+            while r <= r_hi:
+                var h = (ho + pad_h0 - r) // stride_h
+                var s = s_lo
+                while s <= s_hi:
+                    var w = (wo + pad_w0 - s) // stride_w
+
+                    var in_base = ((n * H + h) * W + w) * C
+                    var flt_base = ((r * S + s) * F + f0) * C
+                    var c = 0
+                    while c + simd_size <= C:
+                        var xv = input.ptr.load[width=simd_size](
+                            in_base + c
+                        ).cast[acc_type]()
+                        comptime for jf in range(micro_f):
+                            if f0 + jf < F:
+                                var wv = filter.ptr.load[width=simd_size](
+                                    flt_base + jf * C + c
+                                ).cast[acc_type]()
+                                vacc[jf] = xv.fma(wv, vacc[jf])
+                        c += simd_size
+                    while c < C:
+                        var xs = input.ptr.load(in_base + c).cast[acc_type]()
+                        comptime for jf in range(micro_f):
+                            if f0 + jf < F:
+                                sacc[jf] += (
+                                    xs
+                                    * filter.ptr.load(
+                                        flt_base + jf * C + c
                                     ).cast[acc_type]()
+                                )
+                        c += 1
 
-                                    comptime for jf in range(micro_f):
-                                        if f0 + jf < F:
-                                            var wv = filter.ptr.load[
-                                                width=simd_size
-                                            ](flt_base + jf * C + c).cast[
-                                                acc_type
-                                            ]()
-                                            vacc[jf] = xv.fma(wv, vacc[jf])
-                                    c += simd_size
-
-                                # Scalar tail for C % simd_size.
-                                while c < C:
-                                    var xs = input.ptr.load(in_base + c).cast[
-                                        acc_type
-                                    ]()
-
-                                    comptime for jf in range(micro_f):
-                                        if f0 + jf < F:
-                                            sacc[jf] += (
-                                                xs
-                                                * filter.ptr.load(
-                                                    flt_base + jf * C + c
-                                                ).cast[acc_type]()
-                                            )
-                                    c += 1
-                        s += s_step
-            r += r_step
+                    s += stride_w
+                r += stride_h
+        else:
+            var r = 0
+            while r < R:
+                # `hnum` decreases monotonically in `r`; once negative, stays so.
+                var hnum = ho + pad_h0 - r * dil_h
+                if hnum < 0:
+                    break
+                if hnum % stride_h == 0:
+                    var h = hnum // stride_h
+                    if h < H:
+                        var s = 0
+                        while s < S:
+                            var wnum = wo + pad_w0 - s * dil_w
+                            if wnum < 0:
+                                break
+                            if wnum % stride_w == 0:
+                                var w = wnum // stride_w
+                                if w < W:
+                                    var in_base = ((n * H + h) * W + w) * C
+                                    var flt_base = ((r * S + s) * F + f0) * C
+                                    var c = 0
+                                    while c + simd_size <= C:
+                                        var xv = input.ptr.load[
+                                            width=simd_size
+                                        ](in_base + c).cast[acc_type]()
+                                        comptime for jf in range(micro_f):
+                                            if f0 + jf < F:
+                                                var wv = filter.ptr.load[
+                                                    width=simd_size
+                                                ](flt_base + jf * C + c).cast[
+                                                    acc_type
+                                                ]()
+                                                vacc[jf] = xv.fma(wv, vacc[jf])
+                                        c += simd_size
+                                    while c < C:
+                                        var xs = input.ptr.load(
+                                            in_base + c
+                                        ).cast[acc_type]()
+                                        comptime for jf in range(micro_f):
+                                            if f0 + jf < F:
+                                                sacc[jf] += (
+                                                    xs
+                                                    * filter.ptr.load(
+                                                        flt_base + jf * C + c
+                                                    ).cast[acc_type]()
+                                                )
+                                        c += 1
+                            s += 1
+                r += 1
 
         var out_base = ((n * HO + ho) * WO + wo) * F + f0
 
