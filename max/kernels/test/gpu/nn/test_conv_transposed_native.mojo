@@ -221,4 +221,11 @@ def main() raises:
             stride_val=2,
             pad_val=1,
         ](ctx)
+
+        # Large channel count so the filter slice exceeds the shared-memory cap
+        # and the global-memory (non-staged) kernel path is exercised. 520 is
+        # also non-SIMD-aligned.
+        test_conv_transposed_native[
+            H=4, W=4, R=3, S=3, in_channels=520, out_channels=8, stride_val=2
+        ](ctx)
         print("All native conv_transpose tests passed.")

@@ -47,7 +47,9 @@ from max.algorithm import (
     sync_parallelize,
 )
 from max.gpu.host import DeviceContext
-from std.gpu import block_dim, global_idx, grid_dim
+from max.gpu.sync import barrier
+from std.gpu import block_dim, block_idx, global_idx, grid_dim, thread_idx
+from std.memory import stack_allocation
 from layout import (
     Coord,
     TensorLayout,
@@ -2229,6 +2231,246 @@ def _conv_transpose_gather_2d_kernel[
         i += grid_stride
 
 
+@__name(t"conv_transpose_gather_2d_staged_{output_type}")
+def _conv_transpose_gather_2d_staged_kernel[
+    input_type: DType,
+    filter_type: DType,
+    output_type: DType,
+    acc_type: DType,
+    micro_f: Int,
+    smem_cap: Int,
+    InputLayoutType: TensorLayout,
+    input_origin: ImmOrigin,
+    FilterLayoutType: TensorLayout,
+    filter_origin: ImmOrigin,
+    OutputLayoutType: TensorLayout,
+    output_origin: MutOrigin,
+    elementwise_epilogue: Optional[elementwise_simd_epilogue_type],
+](
+    output: TileTensor[
+        output_type,
+        OutputLayoutType,
+        output_origin,
+        address_space=AddressSpace.GENERIC,
+    ],
+    input: TileTensor[
+        input_type,
+        InputLayoutType,
+        input_origin,
+        address_space=AddressSpace.GENERIC,
+    ],
+    filter: TileTensor[
+        filter_type,
+        FilterLayoutType,
+        filter_origin,
+        address_space=AddressSpace.GENERIC,
+    ],
+    stride_h: Int,
+    stride_w: Int,
+    dil_h: Int,
+    dil_w: Int,
+    pad_h0: Int,
+    pad_w0: Int,
+):
+    """Gather transposed convolution with the filter tile staged in shared memory.
+
+    Opt (4): a block owns a single output-channel tile (`block_idx.y`) and a
+    slab of output spatial locations (`block_idx.x`). Every thread in the block
+    reuses the same filter slice `filter[:, :, f0 : f0 + micro_f, :]`, so it is
+    loaded cooperatively into threadgroup memory once and read from there in the
+    contraction, cutting filter global-memory traffic by up to the block size.
+    Only launched when the slice fits in `smem_cap` (host-checked); larger
+    filters use the global-memory kernel instead.
+
+    Parameters:
+        input_type: Element type of the input tensor.
+        filter_type: Element type of the filter tensor.
+        output_type: Element type of the output tensor.
+        acc_type: Accumulation type (float32 for floating inputs).
+        micro_f: Number of output channels each thread accumulates.
+        smem_cap: Compile-time shared-memory capacity in elements.
+        InputLayoutType: Compile-time layout of the input tensor.
+        input_origin: Immutable memory origin of the input tensor.
+        FilterLayoutType: Compile-time layout of the filter tensor.
+        filter_origin: Immutable memory origin of the filter tensor.
+        OutputLayoutType: Compile-time layout of the output tensor.
+        output_origin: Mutable memory origin of the output tensor.
+        elementwise_epilogue: Optional fused elementwise epilogue.
+
+    Args:
+        output: Output tensor in NHWC layout on device.
+        input: Input tensor in NHWC layout on device.
+        filter: Filter tensor in RSFC layout on device.
+        stride_h: Stride along the height axis.
+        stride_w: Stride along the width axis.
+        dil_h: Dilation along the height axis of the filter.
+        dil_w: Dilation along the width axis of the filter.
+        pad_h0: Lower padding along the height axis.
+        pad_w0: Lower padding along the width axis.
+    """
+    comptime simd_size = simd_width_of[acc_type]()
+
+    var in_shape = coord_to_index_list(input.layout.shape_coord())
+    var out_shape = coord_to_index_list(output.layout.shape_coord())
+    var flt_shape = coord_to_index_list(filter.layout.shape_coord())
+
+    var N = in_shape[0]
+    var H = in_shape[1]
+    var W = in_shape[2]
+    var C = in_shape[3]
+    var HO = out_shape[1]
+    var WO = out_shape[2]
+    var F = out_shape[3]
+    var R = flt_shape[0]
+    var S = flt_shape[1]
+
+    # This block's output-channel tile.
+    var f0 = Int(block_idx.y) * micro_f
+
+    # Stage filter[:, :, f0 : f0 + micro_f, :] into shared memory, cast to the
+    # accumulation type. Out-of-range channels are zero-filled so the inner loop
+    # can read unconditionally. Shared layout: [(r*S+s)*micro_f*C + jf*C + c].
+    var smem = stack_allocation[
+        smem_cap, acc_type, address_space=AddressSpace.SHARED
+    ]()
+    var slice_elems = R * S * micro_f * C
+    var bdim = Int(block_dim.x)
+    var t = Int(thread_idx.x)
+    while t < slice_elems:
+        var cc = t % C
+        var t2 = t // C
+        var jf = t2 % micro_f
+        var tap = t2 // micro_f
+        var f = f0 + jf
+        var val = Scalar[acc_type](0)
+        if f < F:
+            val = filter.ptr.load(tap * F * C + f * C + cc).cast[acc_type]()
+        smem[t] = val
+        t += bdim
+    barrier()
+
+    # This thread's output spatial location. All threads reach the barrier above
+    # before any out-of-range thread returns here.
+    var sp = Int(block_idx.x) * bdim + Int(thread_idx.x)
+    if sp >= N * HO * WO:
+        return
+
+    var tmp = sp
+    var wo = tmp % WO
+    tmp //= WO
+    var ho = tmp % HO
+    tmp //= HO
+    var n = tmp
+
+    var vacc = InlineArray[SIMD[acc_type, simd_size], micro_f](
+        fill=SIMD[acc_type, simd_size](0)
+    )
+    var sacc = InlineArray[Scalar[acc_type], micro_f](fill=Scalar[acc_type](0))
+
+    # Same interior/halo tap enumeration as the global kernel (Opt 5), but the
+    # contraction reads the filter from shared memory (already acc_type, and
+    # zero-filled past F so no per-channel guard is needed).
+    if dil_h == 1 and dil_w == 1:
+        var p_h = (ho + pad_h0) % stride_h
+        var r_hi = min(R - 1, ho + pad_h0)
+        var r_lo_base = max(0, ho + pad_h0 - (H - 1) * stride_h)
+        var r_lo = (
+            r_lo_base + (((p_h - r_lo_base) % stride_h) + stride_h) % stride_h
+        )
+
+        var p_w = (wo + pad_w0) % stride_w
+        var s_hi = min(S - 1, wo + pad_w0)
+        var s_lo_base = max(0, wo + pad_w0 - (W - 1) * stride_w)
+        var s_lo = (
+            s_lo_base + (((p_w - s_lo_base) % stride_w) + stride_w) % stride_w
+        )
+
+        var r = r_lo
+        while r <= r_hi:
+            var h = (ho + pad_h0 - r) // stride_h
+            var s = s_lo
+            while s <= s_hi:
+                var w = (wo + pad_w0 - s) // stride_w
+
+                var in_base = ((n * H + h) * W + w) * C
+                var smem_base = (r * S + s) * micro_f * C
+                var c = 0
+                while c + simd_size <= C:
+                    var xv = input.ptr.load[width=simd_size](in_base + c).cast[
+                        acc_type
+                    ]()
+                    comptime for jf in range(micro_f):
+                        var wv = smem.load[width=simd_size](
+                            smem_base + jf * C + c
+                        )
+                        vacc[jf] = xv.fma(wv, vacc[jf])
+                    c += simd_size
+                while c < C:
+                    var xs = input.ptr.load(in_base + c).cast[acc_type]()
+                    comptime for jf in range(micro_f):
+                        sacc[jf] += xs * smem.load(smem_base + jf * C + c)
+                    c += 1
+
+                s += stride_w
+            r += stride_h
+    else:
+        var r = 0
+        while r < R:
+            var hnum = ho + pad_h0 - r * dil_h
+            if hnum < 0:
+                break
+            if hnum % stride_h == 0:
+                var h = hnum // stride_h
+                if h < H:
+                    var s = 0
+                    while s < S:
+                        var wnum = wo + pad_w0 - s * dil_w
+                        if wnum < 0:
+                            break
+                        if wnum % stride_w == 0:
+                            var w = wnum // stride_w
+                            if w < W:
+                                var in_base = ((n * H + h) * W + w) * C
+                                var smem_base = (r * S + s) * micro_f * C
+                                var c = 0
+                                while c + simd_size <= C:
+                                    var xv = input.ptr.load[width=simd_size](
+                                        in_base + c
+                                    ).cast[acc_type]()
+                                    comptime for jf in range(micro_f):
+                                        var wv = smem.load[width=simd_size](
+                                            smem_base + jf * C + c
+                                        )
+                                        vacc[jf] = xv.fma(wv, vacc[jf])
+                                    c += simd_size
+                                while c < C:
+                                    var xs = input.ptr.load(in_base + c).cast[
+                                        acc_type
+                                    ]()
+                                    comptime for jf in range(micro_f):
+                                        sacc[jf] += xs * smem.load(
+                                            smem_base + jf * C + c
+                                        )
+                                    c += 1
+                        s += 1
+            r += 1
+
+    var out_base = ((n * HO + ho) * WO + wo) * F + f0
+
+    comptime for jf in range(micro_f):
+        if f0 + jf < F:
+            var acc = vacc[jf].reduce_add() + sacc[jf]
+
+            comptime if elementwise_epilogue:
+                comptime epilogue = elementwise_epilogue.value()
+                epilogue(
+                    Index(n, ho, wo, f0 + jf),
+                    SIMD[output_type, 1](acc.cast[output_type]()),
+                )
+            else:
+                output.ptr.store(out_base + jf, acc.cast[output_type]())
+
+
 def conv_transposed_gpu_native[
     input_type: DType,
     filter_type: DType,
@@ -2299,12 +2541,51 @@ def conv_transposed_gpu_native[
     comptime micro_f = 4
 
     var num_f_tiles = ceildiv(conv_shape.f, micro_f)
-    var total = conv_shape.n * conv_shape.ho() * conv_shape.wo() * num_f_tiles
-    if total == 0:
+    var spatial = conv_shape.n * conv_shape.ho() * conv_shape.wo()
+    if spatial * num_f_tiles == 0:
         return
 
     comptime block_size = 256
-    var grid_size = ceildiv(total, block_size)
+
+    # Opt (4): stage the per-block filter slice in shared memory when it fits in
+    # the threadgroup budget; otherwise fall back to the global-memory kernel.
+    comptime smem_cap = 4096  # elements of acc_type (16 KiB at fp32)
+    var slice_elems = (
+        conv_shape.filter_window_flat_size() * micro_f * (conv_shape.c)
+    )
+
+    if slice_elems <= smem_cap:
+        comptime staged_kernel = _conv_transpose_gather_2d_staged_kernel[
+            input_type,
+            filter_type,
+            output_type,
+            acc_type,
+            micro_f,
+            smem_cap,
+            InputLayoutType=input.LayoutType,
+            input_origin=ImmOrigin(input.origin),
+            FilterLayoutType=filter.LayoutType,
+            filter_origin=ImmOrigin(filter.origin),
+            OutputLayoutType=output.LayoutType,
+            output_origin=output.origin,
+            elementwise_epilogue=elementwise_epilogue,
+        ]
+
+        var spatial_blocks = ceildiv(spatial, block_size)
+        ctx.enqueue_function[staged_kernel](
+            output,
+            input.as_immut(),
+            filter.as_immut(),
+            conv_shape.stride[0],
+            conv_shape.stride[1],
+            conv_shape.dilation[0],
+            conv_shape.dilation[1],
+            conv_shape.pad_h[0],
+            conv_shape.pad_w[0],
+            grid_dim=(spatial_blocks, num_f_tiles),
+            block_dim=(block_size,),
+        )
+        return
 
     comptime kernel = _conv_transpose_gather_2d_kernel[
         input_type,
@@ -2321,6 +2602,7 @@ def conv_transposed_gpu_native[
         elementwise_epilogue=elementwise_epilogue,
     ]
 
+    var grid_size = ceildiv(spatial * num_f_tiles, block_size)
     ctx.enqueue_function[kernel](
         output,
         input.as_immut(),
