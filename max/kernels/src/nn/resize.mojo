@@ -16,16 +16,8 @@ from std.math import ceil, floor
 
 
 from max.algorithm.functional import elementwise
-from max.algorithm.reduction import _get_nd_indices_from_flat_index
 from max.gpu.host import DeviceContext
-from layout import (
-    Coord,
-    TensorLayout,
-    TileTensor,
-    coord_to_index_list,
-    row_major,
-)
-from std.memory import unsafe_memcpy
+from layout import Coord, TileTensor
 
 from std.utils import IndexList, StaticTuple
 
@@ -87,10 +79,9 @@ def coord_transform[
         if out_dim == 1:
             return 0
         # note: resized image will have same corners as original image
-        return (
-            out_coord_f32
-            * (Float64(in_dim - 1) / Float64(out_dim - 1)).cast[.float32]()
-        )
+        # use Float32 throughout so the kernel stays valid on GPU targets
+        # (Metal rejects Float64), matching the CPU path within tolerance.
+        return out_coord_f32 * (Float32(in_dim - 1) / Float32(out_dim - 1))
     elif mode == CoordinateTransformationMode.Asymmetric:
         return out_coord_f32 / scale
     else:
@@ -250,198 +241,119 @@ def linear_filter(x: Float32) -> Float32:
     return 0
 
 
-@__parameter
-@always_inline
-def interpolate_point_1d[
-    InputLayoutType: TensorLayout,
+def resize_linear[
+    dtype: DType,
     //,
     coordinate_transformation_mode: CoordinateTransformationMode,
     antialias: Bool,
-    dtype: DType,
-    interpolation_mode: InterpolationMode,
+    target: StaticString = "cpu",
 ](
-    interpolator: Interpolator[interpolation_mode],
-    dim: Int,
-    out_coords: IndexList[InputLayoutType.rank],
-    scale: Float32,
     input: TileTensor[
-        mut=False, dtype, InputLayoutType, address_space=.GENERIC, ...
+        mut=False, dtype, address_space=AddressSpace.GENERIC, ...
     ],
-    output: TileTensor[mut=True, dtype, address_space=.GENERIC, ...],
-):
-    """Computes one-dimensional interpolation for a single output point along a given dimension.
-
-    Parameters:
-        InputLayoutType: The layout type of the input tensor.
-        coordinate_transformation_mode: The coordinate transformation mode to apply.
-        antialias: Whether to stretch the filter to antialias when downsampling.
-        dtype: The element type of the input and output tensors.
-        interpolation_mode: The interpolation mode to use.
-
-    Args:
-        interpolator: The interpolator providing the filter function.
-        dim: The dimension along which to interpolate.
-        out_coords: The multi-dimensional coordinates of the output point.
-        scale: The ratio of output dimension size to input dimension size.
-        input: The input tensor to read from.
-        output: The output tensor to write the interpolated value to.
-    """
-    var center = (
-        coord_transform[coordinate_transformation_mode](
-            out_coords[dim], Int(input.dim(dim)), Int(output.dim(dim)), scale
-        )
-        + 0.5
-    )
-    var filter_scale = 1 / scale if antialias and scale < 1 else 1
-    var support = Float32(interpolator.filter_length()) * filter_scale
-    var xmin = max(Int(center - support + 0.5), 0)
-    var xmax = min(Int(input.dim(dim)), Int(center + support + 0.5))
-    var in_coords = out_coords
-    var sum = Scalar[dtype](0)
-    var acc = Scalar[dtype](0)
-    var ss = 1 / filter_scale
-    for k in range(xmax - xmin):
-        in_coords[dim] = k + xmin
-        var dist_from_center = (
-            (Float32(k + xmin) + Float32(0.5)) - center
-        ) * ss
-        var filter_coeff = interpolator.filter(dist_from_center).cast[dtype]()
-        var in_idx = input.layout(Coord(in_coords))
-        acc += input.raw_load(in_idx) * filter_coeff
-        sum += filter_coeff
-
-    # normalize to handle cases near image boundary where only 1 point is used
-    # for interpolation
-    var out_idx = output.layout(Coord(out_coords))
-    output.raw_store(out_idx, acc / sum)
-
-
-def resize_linear[
-    coordinate_transformation_mode: CoordinateTransformationMode,
-    antialias: Bool,
-    dtype: DType,
-](
-    input: TileTensor[mut=True, dtype, address_space=.GENERIC, ...],
-    output: TileTensor[mut=True, dtype, address_space=.GENERIC, ...],
-):
+    output: TileTensor[
+        mut=True, dtype, address_space=AddressSpace.GENERIC, ...
+    ],
+    ctx: DeviceContext,
+) raises:
     """Resizes input to output shape using linear interpolation.
 
+    Linear interpolation is separable, so an N-D output value is the weighted
+    sum over the Cartesian product of the per-dimension 1-D filter windows,
+    normalized by the total accumulated weight. This is expressed as a single
+    `elementwise` pass over the output, so the same code runs on CPU or GPU
+    depending on `target`, without allocating intermediate buffers.
+
     Parameters:
+        dtype: Type of input and output (inferred).
         coordinate_transformation_mode: How to map a coordinate in output to a coordinate in input.
         antialias: Whether or not to use an antialiasing linear/cubic filter, which when downsampling, uses
             more points to avoid aliasing artifacts. Effectively stretches the filter by a factor of 1 / scale.
-        dtype: Type of input and output.
+        target: `StaticString` identifying the execution platform, used to
+            select between the GPU and CPU code paths.
 
     Args:
         input: The input to be resized.
         output: The output containing the resized input.
-
-
+        ctx: The device context used to launch the kernel.
     """
-    _resize[
-        InterpolationMode.Linear, coordinate_transformation_mode, antialias
-    ](input, output)
-
-
-def _resize[
-    interpolation_mode: InterpolationMode,
-    coordinate_transformation_mode: CoordinateTransformationMode,
-    antialias: Bool,
-    dtype: DType,
-](
-    input: TileTensor[mut=True, dtype, address_space=.GENERIC, ...],
-    output: TileTensor[mut=True, dtype, address_space=.GENERIC, ...],
-):
     comptime assert (
         input.rank == output.rank
     ), "input rank must match output rank"
 
-    if rebind[IndexList[input.rank]](
-        coord_to_index_list(input.layout.shape_coord())
-    ) == rebind[IndexList[input.rank]](
-        coord_to_index_list(output.layout.shape_coord())
-    ):
-        return unsafe_memcpy(
-            dest=output.ptr, src=input.ptr, count=input.num_elements()
-        )
-    var scales = StaticTuple[Float32, input.rank]()
-    var resize_dims = List[Int](capacity=input.rank)
-    var tmp_dims = IndexList[input.rank](0)
-    for i in range(input.rank):
-        # need to consider output dims when upsampling and input dims when downsampling
-        tmp_dims[i] = max(Int(input.dim(i)), Int(output.dim(i)))
+    comptime rank = input.rank
+    var interpolator = Interpolator[InterpolationMode.Linear]()
+
+    # Precomputed on the host; captured by value into the kernel so no Float64
+    # arithmetic runs on the device (Metal rejects Float64).
+    var scales = StaticTuple[Float32, rank]()
+    for i in range(rank):
         scales[i] = (Float64(output.dim(i)) / Float64(input.dim(i))).cast[
             DType.float32
         ]()
-        if Int(input.dim(i)) != Int(output.dim(i)):
-            resize_dims.append(i)
-    var interpolator = Interpolator[interpolation_mode]()
 
-    var in_ptr = input.ptr.unsafe_origin_cast[MutUntrackedOrigin]()
-    # SAFETY: Placeholder; always overwritten below.
-    var out_ptr = UnsafePointer[Scalar[dtype], MutAnyOrigin].unsafe_dangling()
-
-    var using_tmp1 = False
-    var tmp_buffer1 = List[Scalar[dtype]]()
-    var tmp_buffer2 = List[Scalar[dtype]]()
-
-    # ping pong between using tmp_buffer1 and tmp_buffer2 to store outputs
-    # of 1d interpolation pass across one of the dimensions
-    if len(resize_dims) == 1:  # avoid allocating tmp_buffer
-        out_ptr = output.ptr.unsafe_origin_cast[MutAnyOrigin]()
-    if len(resize_dims) > 1:  # avoid allocating second tmp_buffer
-        tmp_buffer1 = List[Scalar[dtype]](
-            unsafe_uninit_length=tmp_dims.flattened_length()
-        )
-        out_ptr = tmp_buffer1.unsafe_ptr().as_unsafe_any_origin()
-        using_tmp1 = True
-    if len(resize_dims) > 2:  # need a second tmp_buffer
-        # TODO: if you are upsampling all dims, you can use the output in place of tmp_buffer2
-        # as long as you make sure that the last iteration uses tmp1_buffer as the input
-        # and tmp_buffer2 (output) as the output
-        tmp_buffer2 = List[Scalar[dtype]](
-            unsafe_uninit_length=tmp_dims.flattened_length()
-        )
-    var in_shape = coord_to_index_list(input.layout.shape_coord())
-    var out_shape = coord_to_index_list(input.layout.shape_coord())
-    # interpolation is separable, so perform 1d interpolation across each
-    # interpolated dimension
-    for dim_idx in range(len(resize_dims)):
-        if dim_idx == len(resize_dims) - 1:
-            out_ptr = output.ptr.unsafe_origin_cast[MutAnyOrigin]()
-        var resize_dim = resize_dims[dim_idx]
-        out_shape[resize_dim] = Int(output.dim(resize_dim))
-
-        var in_buf = TileTensor(in_ptr, row_major(Coord(in_shape)))
-        var out_buf = TileTensor(out_ptr, row_major(Coord(out_shape)))
-
-        var num_rows = out_buf.num_elements() // out_shape[resize_dim]
-        for row_idx in range(num_rows):
-            var coords = _get_nd_indices_from_flat_index(
-                row_idx, out_shape, resize_dim
-            )
-            for i in range(out_shape[resize_dim]):
-                coords[resize_dim] = i
-                interpolate_point_1d[
-                    InputLayoutType=in_buf.LayoutType,
-                    coordinate_transformation_mode,
-                    antialias,
-                ](
-                    interpolator,
-                    resize_dim,
-                    rebind[IndexList[in_buf.rank]](coords),
-                    scales[resize_dim],
-                    in_buf,
-                    out_buf,
+    def linear_interpolate[
+        simd_width: Int, alignment: Int = 1
+    ](out_coords: Coord) {var}:
+        # Build the per-dimension interpolation window.
+        var win_min = IndexList[rank](0)
+        var win_count = IndexList[rank](0)
+        var centers = StaticTuple[Float32, rank]()
+        var inv_filter_scale = StaticTuple[Float32, rank]()
+        var total_taps = 1
+        comptime for d in range(rank):
+            var out_coord = Int(out_coords[d].value())
+            var in_dim = Int(input.dim(d))
+            var out_dim = Int(output.dim(d))
+            if in_dim == out_dim:
+                # Dimension is not resized: a single unit-weight tap that copies
+                # the input coordinate through unchanged.
+                win_min[d] = out_coord
+                win_count[d] = 1
+                centers[d] = Float32(out_coord) + Float32(0.5)
+                inv_filter_scale[d] = 1
+            else:
+                var center = coord_transform[coordinate_transformation_mode](
+                    out_coord, in_dim, out_dim, scales[d]
+                ) + Float32(0.5)
+                var filter_scale = 1 / scales[d] if antialias and scales[
+                    d
+                ] < 1 else Float32(1)
+                var support = (
+                    Float32(interpolator.filter_length()) * filter_scale
                 )
+                win_min[d] = max(Int(center - support + 0.5), 0)
+                win_count[d] = (
+                    min(in_dim, Int(center + support + 0.5)) - win_min[d]
+                )
+                centers[d] = center
+                inv_filter_scale[d] = 1 / filter_scale
+            total_taps *= win_count[d]
 
-        in_shape = out_shape
-        in_ptr = out_ptr.unsafe_origin_cast[MutUntrackedOrigin]()
+        # Accumulate over the Cartesian product of the per-dimension windows.
+        var acc = Float32(0)
+        var weight_sum = Float32(0)
+        for tap in range(total_taps):
+            var rem = tap
+            var in_coords = IndexList[rank](0)
+            var weight = Float32(1)
+            comptime for d in range(rank):
+                var k = rem % win_count[d]
+                rem //= win_count[d]
+                var idx = win_min[d] + k
+                in_coords[d] = idx
+                var dist = (
+                    (Float32(idx) + Float32(0.5)) - centers[d]
+                ) * inv_filter_scale[d]
+                weight *= interpolator.filter(dist)
+            var in_idx = input.layout(Coord(in_coords))
+            acc += input.raw_load(in_idx).cast[DType.float32]() * weight
+            weight_sum += weight
 
-        out_ptr = (
-            tmp_buffer2.unsafe_ptr() if using_tmp1 else tmp_buffer1.unsafe_ptr()
-        ).as_unsafe_any_origin()
-        using_tmp1 = not using_tmp1
+        # Normalize; handles image boundaries where only some taps are in range.
+        var out_idx = output.layout(out_coords)
+        output.raw_store(out_idx, (acc / weight_sum).cast[dtype]())
 
-    _ = tmp_buffer1^
-    _ = tmp_buffer2^
+    elementwise[1, target=target](
+        linear_interpolate, output.layout.shape_coord(), ctx
+    )

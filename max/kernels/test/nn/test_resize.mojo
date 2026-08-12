@@ -281,7 +281,7 @@ def main() raises:
         ]
 
         resize_linear[CoordinateTransformationMode.HalfPixel, False](
-            input, output
+            input, output, ctx
         )
 
         for i in range(16):
@@ -326,7 +326,7 @@ def main() raises:
         ]
 
         resize_linear[CoordinateTransformationMode.AlignCorners, False](
-            input, output
+            input, output, ctx
         )
 
         for i in range(16):
@@ -364,7 +364,7 @@ def main() raises:
         ]
 
         resize_linear[CoordinateTransformationMode.HalfPixel, False](
-            input, output
+            input, output, ctx
         )
 
         for i in range(2):
@@ -401,7 +401,7 @@ def main() raises:
         var reference_stack: Array[Float32, 2] = [Float32(1), 4]
 
         resize_linear[CoordinateTransformationMode.AlignCorners, False](
-            input, output
+            input, output, ctx
         )
 
         for i in range(2):
@@ -464,7 +464,7 @@ def main() raises:
         # fmt: on
 
         resize_linear[CoordinateTransformationMode.HalfPixel, False](
-            input, output
+            input, output, ctx
         )
 
         for i in range(96):
@@ -515,7 +515,7 @@ def main() raises:
         ]
 
         resize_linear[CoordinateTransformationMode.HalfPixel, True](
-            input, output
+            input, output, ctx
         )
 
         for i in range(4):
@@ -543,7 +543,7 @@ def main() raises:
         ]
 
         resize_linear[CoordinateTransformationMode.HalfPixel, False](
-            input, output
+            input, output, ctx
         )
 
         for i in range(4):
