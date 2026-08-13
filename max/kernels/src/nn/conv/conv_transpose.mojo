@@ -48,7 +48,7 @@ from max.algorithm import (
 )
 from max.gpu.host import DeviceContext
 from max.gpu.sync import barrier
-from std.gpu import block_dim, block_idx, global_idx, grid_dim, thread_idx
+from max.gpu import block_dim, block_idx, global_idx, grid_dim, thread_idx
 from std.memory import stack_allocation
 from layout import (
     Coord,
@@ -2008,12 +2008,12 @@ def _conv_transpose_gather_2d_kernel[
         filter_origin,
         address_space=AddressSpace.GENERIC,
     ],
-    stride_h: Int,
-    stride_w: Int,
-    dil_h: Int,
-    dil_w: Int,
-    pad_h0: Int,
-    pad_w0: Int,
+    stride_h_i32: Int32,
+    stride_w_i32: Int32,
+    dil_h_i32: Int32,
+    dil_w_i32: Int32,
+    pad_h0_i32: Int32,
+    pad_w0_i32: Int32,
 ):
     """Gather-based 2D transposed convolution.
 
@@ -2049,6 +2049,16 @@ def _conv_transpose_gather_2d_kernel[
         pad_w0: Lower padding along the width axis.
     """
     comptime simd_size = simd_width_of[acc_type]()
+
+    # `Int`/`UInt` are not `DevicePassable` (they are platform-sized), so the
+    # convolution attributes arrive as `Int32` and are widened back to `Int`
+    # for host-identical index arithmetic below.
+    var stride_h = Int(stride_h_i32)
+    var stride_w = Int(stride_w_i32)
+    var dil_h = Int(dil_h_i32)
+    var dil_w = Int(dil_w_i32)
+    var pad_h0 = Int(pad_h0_i32)
+    var pad_w0 = Int(pad_w0_i32)
 
     # Dimensions are carried by the tensor layouts (NHWC input/output, RSFC
     # filter). The convolution attributes arrive as scalar arguments because a
@@ -2087,12 +2097,10 @@ def _conv_transpose_gather_2d_kernel[
 
         # Opt (3): one SIMD accumulator per output channel in the tile, plus a
         # scalar tail accumulator for the C % simd_size remainder.
-        var vacc = InlineArray[SIMD[acc_type, simd_size], micro_f](
+        var vacc = Array[SIMD[acc_type, simd_size], micro_f](
             fill=SIMD[acc_type, simd_size](0)
         )
-        var sacc = InlineArray[Scalar[acc_type], micro_f](
-            fill=Scalar[acc_type](0)
-        )
+        var sacc = Array[Scalar[acc_type], micro_f](fill=Scalar[acc_type](0))
 
         # Contraction over the contiguous C axis for one filter tap `(r, s)`
         # mapping to input `(h, w)`. The input channel vector is loaded once and
@@ -2265,12 +2273,12 @@ def _conv_transpose_gather_2d_staged_kernel[
         filter_origin,
         address_space=AddressSpace.GENERIC,
     ],
-    stride_h: Int,
-    stride_w: Int,
-    dil_h: Int,
-    dil_w: Int,
-    pad_h0: Int,
-    pad_w0: Int,
+    stride_h_i32: Int32,
+    stride_w_i32: Int32,
+    dil_h_i32: Int32,
+    dil_w_i32: Int32,
+    pad_h0_i32: Int32,
+    pad_w0_i32: Int32,
 ):
     """Gather transposed convolution with the filter tile staged in shared memory.
 
@@ -2309,6 +2317,16 @@ def _conv_transpose_gather_2d_staged_kernel[
         pad_w0: Lower padding along the width axis.
     """
     comptime simd_size = simd_width_of[acc_type]()
+
+    # `Int`/`UInt` are not `DevicePassable` (they are platform-sized), so the
+    # convolution attributes arrive as `Int32` and are widened back to `Int`
+    # for host-identical index arithmetic below.
+    var stride_h = Int(stride_h_i32)
+    var stride_w = Int(stride_w_i32)
+    var dil_h = Int(dil_h_i32)
+    var dil_w = Int(dil_w_i32)
+    var pad_h0 = Int(pad_h0_i32)
+    var pad_w0 = Int(pad_w0_i32)
 
     var in_shape = coord_to_index_list(input.layout.shape_coord())
     var out_shape = coord_to_index_list(output.layout.shape_coord())
@@ -2362,10 +2380,10 @@ def _conv_transpose_gather_2d_staged_kernel[
     tmp //= HO
     var n = tmp
 
-    var vacc = InlineArray[SIMD[acc_type, simd_size], micro_f](
+    var vacc = Array[SIMD[acc_type, simd_size], micro_f](
         fill=SIMD[acc_type, simd_size](0)
     )
-    var sacc = InlineArray[Scalar[acc_type], micro_f](fill=Scalar[acc_type](0))
+    var sacc = Array[Scalar[acc_type], micro_f](fill=Scalar[acc_type](0))
 
     # Same interior/halo tap enumeration as the global kernel (Opt 5), but the
     # contraction reads the filter from shared memory (already acc_type, and
@@ -2576,12 +2594,12 @@ def conv_transposed_gpu_native[
             output,
             input.as_immut(),
             filter.as_immut(),
-            conv_shape.stride[0],
-            conv_shape.stride[1],
-            conv_shape.dilation[0],
-            conv_shape.dilation[1],
-            conv_shape.pad_h[0],
-            conv_shape.pad_w[0],
+            Int32(conv_shape.stride[0]),
+            Int32(conv_shape.stride[1]),
+            Int32(conv_shape.dilation[0]),
+            Int32(conv_shape.dilation[1]),
+            Int32(conv_shape.pad_h[0]),
+            Int32(conv_shape.pad_w[0]),
             grid_dim=(spatial_blocks, num_f_tiles),
             block_dim=(block_size,),
         )
@@ -2607,12 +2625,12 @@ def conv_transposed_gpu_native[
         output,
         input.as_immut(),
         filter.as_immut(),
-        conv_shape.stride[0],
-        conv_shape.stride[1],
-        conv_shape.dilation[0],
-        conv_shape.dilation[1],
-        conv_shape.pad_h[0],
-        conv_shape.pad_w[0],
+        Int32(conv_shape.stride[0]),
+        Int32(conv_shape.stride[1]),
+        Int32(conv_shape.dilation[0]),
+        Int32(conv_shape.dilation[1]),
+        Int32(conv_shape.pad_h[0]),
+        Int32(conv_shape.pad_w[0]),
         grid_dim=(grid_size,),
         block_dim=(block_size,),
     )

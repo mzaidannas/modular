@@ -18,7 +18,7 @@ this test exercises it on whatever GPU the `DeviceContext` selects (Apple
 Silicon, AMD, or NVIDIA), independent of the cuDNN path.
 """
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from layout import Coord, TileTensor, row_major
 from layout._fillers import random
 from nn.conv.conv_transpose import (
